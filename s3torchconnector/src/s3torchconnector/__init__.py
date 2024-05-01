@@ -12,6 +12,7 @@ from .s3map_dataset import S3MapDataset
 from .s3checkpoint import S3Checkpoint
 from ._version import __version__
 from ._s3client import S3ClientConfig
+from .dcp import S3StorageReader, S3StorageWriter
 
 __all__ = [
     "S3IterableDataset",
@@ -21,5 +22,7 @@ __all__ = [
     "S3Writer",
     "S3Exception",
     "S3ClientConfig",
+    "S3StorageReader",
+    "S3StorageWriter",
     "__version__",
 ]
