@@ -10,7 +10,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
-from s3torchconnector import S3StorageWriter
+from s3torchconnector import S3StorageWriter, S3StorageReader
 
 CHECKPOINT_DIR = "checkpoint"
 
@@ -57,7 +57,8 @@ def run_fsdp_checkpoint_save_example(rank, world_size):
     loaded_state_dict = {}
     # DCP.load(
     #     loaded_state_dict,
-    #     storage_reader=DCP.FileSystemReader(CHECKPOINT_DIR)
+    #     # storage_reader=DCP.FileSystemReader(CHECKPOINT_DIR)
+    #     storage_reader=S3StorageReader(region="eu-north-1", s3_uri="s3://dcp-poc-test/", thread_count=world_size)
     # )
 
     # set FSDP StateDictType to SHARDED_STATE_DICT so we can use DCP to checkpoint sharded model state dict

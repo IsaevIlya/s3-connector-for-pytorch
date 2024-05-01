@@ -4,7 +4,6 @@ import dataclasses
 import pickle
 import queue
 import threading
-from hashlib import md5
 from typing import Optional, List
 
 from attr import dataclass
@@ -14,7 +13,6 @@ from torch.distributed.checkpoint.filesystem import _split_by_size_and_type
 from torch.distributed.checkpoint.storage import WriteResult
 from torch.futures import Future
 
-from .. import S3Writer
 from .._s3client import S3Client
 from .._s3client.s3client_config import S3ClientConfig
 from .._s3dataset_common import parse_s3_uri
@@ -39,6 +37,7 @@ class S3StorageWriter(StorageWriter):
             single_file_per_rank: bool = True,
             thread_count: int = 1
         ):
+        super().__init__()
         # TODO: Add support for multiple files per rank
         if not single_file_per_rank:
             raise ValueError("Multiple files per rank not supported yet.")
@@ -59,14 +58,15 @@ class S3StorageWriter(StorageWriter):
         return plan
 
     def prepare_global_plan(self, plans: List[SavePlan]) -> List[SavePlan]:
-        new_plans = [
-            dataclasses.replace(
-                plan,
-                storage_data=_S3StoragePrefix(f"__{i}_")
-            )
-            for i, plan in enumerate(plans)
-        ]
-        return new_plans
+        if self.is_coordinator:
+            new_plans = [
+                dataclasses.replace(
+                    plan,
+                    storage_data=_S3StoragePrefix(f"__{i}_")
+                )
+                for i, plan in enumerate(plans)
+            ]
+            return new_plans
 
     def write_data(
             self,
@@ -138,7 +138,7 @@ class S3StorageWriter(StorageWriter):
 
             serialized_metadata = pickle.dumps(metadata)
             with self._clients[0].put_object(self.bucket, metadata_key) as s3_writer:
-                pickle.dump(serialized_metadata, s3_writer)
+                s3_writer.write(serialized_metadata)
 
     def _write_to_s3(self, objects_queue, results_queue, rank):
         while not objects_queue.empty():
