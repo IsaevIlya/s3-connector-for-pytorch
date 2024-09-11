@@ -12,13 +12,15 @@ from .._s3dataset_common import parse_s3_uri
 
 
 class S3StorageReader(StorageReader):
-    def __init__( self,
-            region: str,
-            s3_uri: str,
-            *,
-            s3client_config: Optional[S3ClientConfig] = None,
-            single_file_per_rank: bool = True,
-            thread_count: int = 1):
+    def __init__(
+        self,
+        region: str,
+        s3_uri: str,
+        *,
+        s3client_config: Optional[S3ClientConfig] = None,
+        single_file_per_rank: bool = True,
+        thread_count: int = 1
+    ):
         super().__init__()
         # TODO: Add support for multiple files per rank
         if not single_file_per_rank:
@@ -27,7 +29,10 @@ class S3StorageReader(StorageReader):
         self.region = region
         self.base_uri = s3_uri
         self.bucket, self.prefix = parse_s3_uri(s3_uri)
-        self._clients = [S3Client(self.region, s3client_config=s3client_config) for _ in range(thread_count)]
+        self._clients = [
+            S3Client(self.region, s3client_config=s3client_config)
+            for _ in range(thread_count)
+        ]
         self.single_file_per_rank = single_file_per_rank
         self.is_coordinator = False
         self.thread_count = thread_count
@@ -50,5 +55,5 @@ class S3StorageReader(StorageReader):
         return plans
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        #TODO: Check expected bucket, prefix etc. in metadata
+        # TODO: Check expected bucket, prefix etc. in metadata
         pass

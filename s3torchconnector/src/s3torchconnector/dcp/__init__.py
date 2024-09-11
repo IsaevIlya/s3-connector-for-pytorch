@@ -8,4 +8,3 @@ __all__ = [
     "S3StorageReader",
     "S3StorageWriter",
 ]
-
