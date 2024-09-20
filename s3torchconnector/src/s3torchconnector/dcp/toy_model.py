@@ -1,13 +1,14 @@
 import torch
-import torch.distributed as dist
 import torch.distributed.checkpoint as DCP
 from torch import nn
 import argparse
 
+import torch.distributed as dist
+
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
-from s3torchconnector import S3StorageWriter, S3StorageReader
+from s3torchconnector import S3StorageWriter, S3StorageReader, S3DPWriter
 
 CHECKPOINT_DIR = "checkpoint"
 
@@ -34,15 +35,14 @@ def cleanup():
 def run_fsdp_checkpoint_save_example(rank, backend):
     print(f"Running basic FSDP checkpoint saving example on rank {rank}.")
 
+    # Need to put tensor on a GPU device for nccl backend
     if backend == "nccl":
-        # Need to put tensor on a GPU device for nccl backend
         device_id = rank % torch.cuda.device_count()
         model = ToyModel().to(device_id)
         model = FSDP(model, device_id=device_id)
     elif backend == "gloo":
-        device_id = torch.device("cpu")
-        model = ToyModel().to(device_id)
-        model = FSDP(model)
+        model = ToyModel().to(device=torch.device("cpu"))
+        model = FSDP(model, device_id=torch.cpu.current_device())
     else:
         raise Exception(f"Unknown backend type: {backend}")
 
@@ -50,7 +50,10 @@ def run_fsdp_checkpoint_save_example(rank, backend):
     optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
 
     optimizer.zero_grad()
-    model(torch.rand(8, 16).to(device_id)).sum().backward()
+    if backend == "nccl":
+        model(torch.rand(8, 16, device=torch.device("cuda"))).sum().backward()
+    else:
+        model(torch.rand(8, 16, device=torch.device("cpu"))).sum().backward()
     optimizer.step()
 
     loaded_state_dict = {}
@@ -70,13 +73,15 @@ def run_fsdp_checkpoint_save_example(rank, backend):
         "model": model.state_dict(),
     }
 
-    DCP.save(
-        state_dict=state_dict,
-        # storage_writer=DCP.FileSystemWriter(CHECKPOINT_DIR, single_file_per_rank=True),
-        storage_writer=S3StorageWriter(
-            region="eu-north-1", s3_uri="s3://dcp-poc-test/epoech_1/"
-        ),
-    )
+    thread_count = 1
+    bucket = "dcp-poc-test"
+    path = f"s3://{bucket}/epoech_1/"
+    region = "us-east-1"
+    # writer_to_use = "local"
+    writer_to_use = "s3_fs"
+    writer = get_writer(region, path, thread_count, writer_to_use)
+
+    DCP.save(state_dict=state_dict, storage_writer=writer)
 
     state_dict = {
         "model": model.state_dict(),
@@ -84,13 +89,19 @@ def run_fsdp_checkpoint_save_example(rank, backend):
     }
     optimizer.step()
 
-    DCP.save(
-        state_dict=state_dict,
-        # storage_writer=DCP.FileSystemWriter(CHECKPOINT_DIR),
-        storage_writer=S3StorageWriter(
-            region="eu-north-1", s3_uri="s3://dcp-poc-test/epoech_2/"
-        ),
-    )
+    path = f"s3://{bucket}/epoech_2/"
+    writer = get_writer(region, path, thread_count, writer_to_use)
+    DCP.save(state_dict=state_dict, storage_writer=writer)
+
+
+def get_writer(region, path, thread_count, writer_to_use):
+    if writer_to_use == "local":
+        writer = DCP.FileSystemWriter(CHECKPOINT_DIR, single_file_per_rank=True)
+    elif writer_to_use == "s3_fs":
+        writer = S3DPWriter(region=region, path=path, thread_count=thread_count)
+    else:
+        writer = S3StorageWriter(region=region, s3_uri=path, thread_count=thread_count)
+    return writer
 
 
 if __name__ == "__main__":
@@ -115,7 +126,7 @@ if __name__ == "__main__":
         --nproc_per_node=4: Run four processes on each node (instance).
         --nnodes=2: Use two nodes (instances) for training.
         --node_rank=0 (master) / --node_rank=1 (worker): Set the rank of the current node.
-        --master_addr=172.31.18.217: Set the IP address of the master host.
+        --master_addr=172.31.18.217: Set the IP address of the master host. Use private IP address.
         --master_port=1234: Set the port number the master host is listening on.
         toy_model.py: The script to run for training.
         --backend=gloo: Use the gloo backend, which utilizes CPU for training.
