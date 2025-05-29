@@ -14,6 +14,12 @@ from s3torchconnectorclient._mountpoint_s3_client import (
 
 from .s3reader import S3Reader
 
+import logging
+
+import os
+
+logger = logging.getLogger(__name__)
+
 DEFAULT_BUFFER_SIZE = 8 * 1024 * 1024  # 8MB
 
 
@@ -207,6 +213,7 @@ class RangedS3Reader(S3Reader):
         Returns:
             int : numer of bytes read or zero, if no bytes available
         """
+        logger.debug("pid:%r readinto(%r) key:%s", self._pid, len(buf), self._key)
 
         try:
             view = memoryview(buf)
@@ -249,6 +256,8 @@ class RangedS3Reader(S3Reader):
         Raises:
             S3Exception: An error occurred accessing S3.
         """
+
+        logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
 
         if size is not None and not isinstance(size, int):
             raise TypeError(f"argument should be integer or None, not {type(size)!r}")
@@ -293,6 +302,9 @@ class RangedS3Reader(S3Reader):
             S3Exception: An error occurred accessing S3.
 
         """
+
+        logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
+
         if not isinstance(offset, int):
             raise TypeError(f"integer argument expected, got {type(offset)!r}")
         if whence == SEEK_END:
