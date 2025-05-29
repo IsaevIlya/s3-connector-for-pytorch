@@ -12,6 +12,12 @@ from s3torchconnectorclient._mountpoint_s3_client import (
     HeadObjectResult,
 )
 
+import logging
+
+import os
+
+logger = logging.getLogger(__name__)
+
 
 class S3Reader(io.BufferedIOBase):
     """A read-only, file like representation of a single object stored in S3."""
@@ -34,6 +40,8 @@ class S3Reader(io.BufferedIOBase):
         self._size: Optional[int] = None
         # Invariant: _position == _buffer._tell() unless _position_at_end()
         self._position = 0
+        self._pid = os.getpid()
+
 
     @property
     def bucket(self):
@@ -101,6 +109,8 @@ class S3Reader(io.BufferedIOBase):
             S3Exception: An error occurred accessing S3.
         """
 
+        logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
+
         if size is not None and not isinstance(size, int):
             raise TypeError(f"argument should be integer or None, not {type(size)!r}")
         if self._position_at_end():
@@ -144,6 +154,7 @@ class S3Reader(io.BufferedIOBase):
             S3Exception: An error occurred accessing S3.
 
         """
+        logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
         if not isinstance(offset, int):
             raise TypeError(f"integer argument expected, got {type(offset)!r}")
         if whence == SEEK_END:
