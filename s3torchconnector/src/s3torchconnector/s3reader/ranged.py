@@ -83,6 +83,7 @@ class RangedS3Reader(S3Reader):
         # Track buffer byte range
         self._buffer_start: int = 0
         self._buffer_end: int = 0
+        self._pid = os.getpid()
 
     @property
     def bucket(self) -> str:
