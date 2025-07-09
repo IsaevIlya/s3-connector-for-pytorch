@@ -32,6 +32,8 @@ from s3torchbenchmarking.benchmark_utils import (
     build_checkpoint_uri,
 )
 
+from s3torchconnector.s3reader import S3ReaderConstructor
+
 Timestamps = Tuple[float, float]
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,8 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout)
     ]
 )
+
+from s3torchconnector import S3ReaderConstructor
 
 def setup(backend: str, world_size: int, rank: int) -> None:
     os.environ["MASTER_ADDR"] = "localhost"
@@ -59,7 +63,9 @@ def get_writer(region:str, uri: str, suffix: str, thread_count: int = 8) -> File
 def get_reader(region:str, uri: str, suffix: str) -> FileSystemReader:
     uri = build_checkpoint_uri(uri, suffix)
     logger.info("Loading checkpoint from %s (S3)...", uri)
-    return S3StorageReader(region, uri)
+    reader_constructor = S3ReaderConstructor.sequential()
+    # reader_constructor = S3ReaderConstructor.range_based(8*1024*1024)
+    return S3StorageReader(region, uri, reader_constructor=reader_constructor)
 
 
 def run_fsdp(
