@@ -80,7 +80,7 @@ class SequentialS3Reader(S3Reader):
         Returns:
             int : numer of bytes read or zero, if no bytes available
         """
-        logger.debug("pid:%r readinto(%r) key:%s", self._pid, len(buf), self._key)
+        logger.debug(f"pid:{self._pid} readinto({len(buf)}) at position({self._position}) key:{self.key}")
         buf_size = len(buf)
         if self._position_at_end() or buf_size == 0:
             # If no bytes are available or no place to write data, zero should be returned
@@ -115,7 +115,7 @@ class SequentialS3Reader(S3Reader):
             S3Exception: An error occurred accessing S3.
         """
 
-        logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
+        logger.debug(f"pid:{self._pid} read({size}) at position({self._position}) key:{self.key}")
 
         if size is not None and not isinstance(size, int):
             raise TypeError(f"argument should be integer or None, not {type(size)!r}")
@@ -160,7 +160,7 @@ class SequentialS3Reader(S3Reader):
             S3Exception: An error occurred accessing S3.
 
         """
-        logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
+        # logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
         if not isinstance(offset, int):
             raise TypeError(f"integer argument expected, got {type(offset)!r}")
         if whence == SEEK_END:

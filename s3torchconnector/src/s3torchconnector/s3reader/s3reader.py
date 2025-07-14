@@ -30,6 +30,10 @@ class S3Reader(ABC, io.BufferedIOBase):
         pass
 
     @abstractmethod
+    def read1(self, size: Optional[int] = None) -> io.BytesIO:
+        pass
+
+    @abstractmethod
     def seek(self, offset: int, whence: int = SEEK_SET, /) -> int:
         pass
 

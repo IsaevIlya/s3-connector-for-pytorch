@@ -183,6 +183,9 @@ class RangedS3Reader(S3Reader):
 
         bytes_read = 0
 
+        if self._buffer_start > start:
+            logger.debug(f"request range {start}-{end} while buffer {self._buffer_start}-{self._buffer_end}")
+
         # Forward overlap case: load from overlapped part in buffer first
         # Only apply when starting within buffer and extending beyond it
         if self._buffer_start <= start < self._buffer_end < end:
@@ -214,7 +217,7 @@ class RangedS3Reader(S3Reader):
         Returns:
             int : numer of bytes read or zero, if no bytes available
         """
-        logger.debug("pid:%r readinto(%r) key:%s", self._pid, len(buf), self._key)
+        # logger.debug("pid:%r readinto(%r) key:%s", self._pid, len(buf), self._key)
 
         try:
             view = memoryview(buf)
@@ -258,7 +261,7 @@ class RangedS3Reader(S3Reader):
             S3Exception: An error occurred accessing S3.
         """
 
-        logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
+        # logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
 
         if size is not None and not isinstance(size, int):
             raise TypeError(f"argument should be integer or None, not {type(size)!r}")
@@ -286,6 +289,49 @@ class RangedS3Reader(S3Reader):
         self._read_range(view, start, end)
         return view.tobytes()
 
+    def read1(self, size: Optional[int] = None) -> io.BytesIO:
+        """Read up to size bytes from the current position.
+
+        If size is zero or positive, read that many bytes from S3, or until the end of the object.
+        If size is None or negative, read until the end of the object.
+
+        Args:
+            size (int | None): how many bytes to read.
+
+        Returns:
+            bytes: Bytes read from specified range.
+
+        Raises:
+            S3Exception: An error occurred accessing S3.
+        """
+
+        # logger.debug("pid:%r read(%r) key:%s", self._pid, size, self._key)
+
+        if size is not None and not isinstance(size, int):
+            raise TypeError(f"argument should be integer or None, not {type(size)!r}")
+        if self._position_at_end():
+            # Invariant: if we're at EOF, it doesn't matter what `size` is, we'll always return no data and have no
+            # side effect.
+            return b""
+
+        # Calculate the range to request
+        start = self._position
+        if size is None or size < 0:
+            end = self._get_size()
+        else:
+            end = min(start + size, self._get_size())
+
+        # Return no data if zero-length range
+        if start >= end:
+            return b""
+
+        # Pre-allocate buffer
+        byte_size = end - start
+        buffer = io.BytesIO(b'\0' * byte_size)
+
+        self._read_range(buffer.getbuffer(), start, end)
+        return buffer
+
     def seek(self, offset: int, whence: int = SEEK_SET, /) -> int:
         """Change the stream position to the given byte offset, interpreted relative to whence.
 
@@ -304,7 +350,7 @@ class RangedS3Reader(S3Reader):
 
         """
 
-        logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
+        # logger.debug("pid:%r seek(%r, %r, %r) key:%s", self._pid, offset, whence, self._position, self._key)
 
         if not isinstance(offset, int):
             raise TypeError(f"integer argument expected, got {type(offset)!r}")

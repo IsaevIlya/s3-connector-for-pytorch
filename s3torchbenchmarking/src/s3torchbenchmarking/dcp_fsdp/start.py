@@ -3,6 +3,7 @@
 
 import logging
 import functools
+from dataclasses import dataclass
 from time import perf_counter
 from typing import Tuple
 import os
@@ -63,9 +64,98 @@ def get_writer(region:str, uri: str, suffix: str, thread_count: int = 8) -> File
 def get_reader(region:str, uri: str, suffix: str) -> FileSystemReader:
     uri = build_checkpoint_uri(uri, suffix)
     logger.info("Loading checkpoint from %s (S3)...", uri)
-    reader_constructor = S3ReaderConstructor.sequential()
-    # reader_constructor = S3ReaderConstructor.range_based(8*1024*1024)
+    # reader_constructor = S3ReaderConstructor.sequential()
+    reader_constructor = S3ReaderConstructor.range_based(1*1024*1024)
     return S3StorageReader(region, uri, reader_constructor=reader_constructor)
+
+import re
+# from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
+from torch.distributed.checkpoint.metadata import STATE_DICT_TYPE
+from torch.distributed.checkpoint.state_dict_loader import _load_state_dict
+
+class VirtualRegexContainer:
+    def __init__(self, regex: str):
+        self.regex = re.compile(regex)
+
+    def __contains__(self, item: str) -> bool:
+        print(f"Item name: {item}")
+        verdict = self.regex.search(item) is not None
+        if not verdict:
+            print(f"Skipping {item}")
+        return verdict
+
+
+from torch.distributed.checkpoint.metadata import Metadata, TensorStorageMetadata
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint._traverse import set_element
+from typing import List, Optional
+
+
+
+class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
+    """
+    Extension of DefaultLoadPlanner, which rebuilds state_dict from the saved metadata.
+    Useful for loading in state_dict without first initializing a model, such as
+    when converting a DCP checkpoint into a Torch save file.
+
+    . N.B. `state_dict` must be an empty dictionary when used with this LoadPlanner
+
+    .. warning::
+        Because the entire state dict is initialized, It's recommended to only utilize
+        this LoadPlanner on a single rank or process to avoid OOM.
+
+    """
+
+    def __init__(self, keys=None, *args, **kwargs):
+        self.keys = keys
+        super().__init__(*args, **kwargs)
+
+    def _should_include_key(self, key: str, metadata: Metadata) -> bool:
+        if self.keys is None:
+            return True
+
+        if key in self.keys:
+            True
+
+        unflattened_keys: List[str] = []
+        planner_data = metadata.planner_data.get(key)
+        for unflattened_key in planner_data:
+            if unflattened_keys:
+                unflattened_keys.append(
+                    ".".join([unflattened_keys[-1], str(unflattened_key)])
+                )
+
+            else:
+                unflattened_keys.append(unflattened_key)
+
+        if any(unflattened_key in self.keys for unflattened_key in unflattened_keys):
+            return True
+
+        return False
+
+    def set_up_planner(
+        self,
+        state_dict: STATE_DICT_TYPE,
+        metadata: Optional[Metadata] = None,
+        is_coordinator: bool = False,
+    ) -> None:
+        assert not state_dict
+        assert metadata is not None
+
+        # rebuild the state dict from the metadata
+        for k, v in metadata.state_dict_metadata.items():
+            if not self._should_include_key(k, metadata):
+                continue
+
+            if isinstance(v, TensorStorageMetadata):
+                v = torch.empty(v.size, dtype=v.properties.dtype)  # type: ignore[assignment]
+            if k in metadata.planner_data:
+                set_element(state_dict, metadata.planner_data[k], v)
+            else:
+                state_dict[k] = v
+
+        super().set_up_planner(state_dict, metadata, is_coordinator)
+
 
 
 def run_fsdp(
@@ -125,54 +215,70 @@ def run_fsdp(
             device=torch.device("cpu"), recurse=False
         )
 
-    if checkpoint_sharding_strategy == "full":
-        sharding_strategy = ShardingStrategy.FULL_SHARD
-    elif checkpoint_sharding_strategy == "hybrid":
-        sharding_strategy = ShardingStrategy.HYBRID_SHARD
-    else:
-        raise NotImplementedError("Available sharding strategies are full and hybrid")
+    # if checkpoint_sharding_strategy == "full":
+    #     sharding_strategy = ShardingStrategy.FULL_SHARD
+    # elif checkpoint_sharding_strategy == "hybrid":
+    #     sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    # else:
+    #     raise NotImplementedError("Available sharding strategies are full and hybrid")
 
-    model = FSDP(
-        model,
-        auto_wrap_policy=gpt_auto_wrap_policy,
-        device_id=(
-            torch.cuda.current_device()
-            if backend == "nccl"
-            else torch.cpu.current_device()
-        ),
-        use_orig_params=False,
-        sharding_strategy=sharding_strategy,
-        sync_module_states=True if backend == "nccl" else False,
-        param_init_fn=param_init_fn if rank != 0 else None,
-    )
+    # model = FSDP(
+    #     model,
+    #     auto_wrap_policy=gpt_auto_wrap_policy,
+    #     device_id=(
+    #         torch.cuda.current_device()
+    #         if backend == "nccl"
+    #         else torch.cpu.current_device()
+    #     ),
+    #     use_orig_params=False,
+    #     sharding_strategy=sharding_strategy,
+    #     sync_module_states=True if backend == "nccl" else False,
+    #     param_init_fn=param_init_fn if rank != 0 else None,
+    # )
+    #
+    # if rank == 0:
+    #     print("Wrapped model with FSDP")
+    #
+    # # torch.cuda.empty_cache()
+    # with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
+    #     state_dict = {
+    #         "model": model.state_dict(),
+    #     }
+    #
+    # storage_writer = get_writer(region, uri, suffix, thread_count)
+    # # align all workers to start checkpointing at the same time
+    # dist.barrier()
+    # begin_save = perf_counter()
+    # dcp.save(state_dict, storage_writer=storage_writer)
+    #
+    # dist.barrier()
+    # end_save = perf_counter()
 
-    if rank == 0:
-        print("Wrapped model with FSDP")
-
-    # torch.cuda.empty_cache()
-    with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT):
-        state_dict = {
-            "model": model.state_dict(),
-        }
-
-    storage_writer = get_writer(region, uri, suffix, thread_count)
-    # align all workers to start checkpointing at the same time
-    dist.barrier()
-    begin_save = perf_counter()
-    dcp.save(state_dict, storage_writer=storage_writer)
-
-    dist.barrier()
-    end_save = perf_counter()
-
-    if rank == 0:
-        print(f"The total size of model is {model_size}")
-        print(f"Time taken to save: {end_save - begin_save} seconds")
+    # if rank == 0:
+    #     print(f"The total size of model is {model_size}")
+    #     print(f"Time taken to save: {end_save - begin_save} seconds")
     # Record the save times excluding the influence of the process setup and model loading to device.
 
     storage_reader = get_reader(region, uri, suffix)
     # empty_stat_dict = {"model": None}
     start_load = perf_counter()
-    dcp.load(state_dict, storage_reader=storage_reader)
+    # dcp.load(state_dict, storage_reader=storage_reader)
+    model_only = True
+    sd_out: STATE_DICT_TYPE = {}
+    #     {
+    #     "model": None
+    # }
+    keys_regex = None if not model_only else VirtualRegexContainer("^model\\.*")
+    load_planner = _EmptyStateDictLoadPlanner(keys=keys_regex)
+    _load_state_dict(
+        sd_out,
+        storage_reader,
+        planner=load_planner,
+        no_dist=True,
+    )
+
+    # dcp.load(sd_out, storage_reader=storage_reader)
+
     end_load = perf_counter()
 
     if rank == 0:

@@ -29,7 +29,7 @@ import torch
 from s3torchconnector._s3client import S3Client
 from s3torchconnector._s3dataset_common import parse_s3_uri
 from ..s3reader import S3ReaderConstructor, S3ReaderConstructorProtocol
-from .. import S3ClientConfig
+from .. import S3ClientConfig, S3Reader
 from .s3_prefix_strategy import S3PrefixStrategyBase, DefaultPrefixStrategy
 from .._user_agent import UserAgent
 
@@ -314,6 +314,83 @@ class S3StorageWriter(FileSystemWriter):
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
         return S3FileSystem.validate_checkpoint_id(checkpoint_id)
 
+from torch.futures import Future
+from typing import Dict, cast, IO
+from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, ReadItem, LoadItemType
+from torch import Tensor
+from torch.distributed._shard._utils import narrow_tensor_by_index
+import heapq
+
+class ByteArrayIO:
+    def __init__(self, buf: bytearray):
+        self.buf = buf
+        self.pos = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            size = len(self.buf) - self.pos
+        end = min(self.pos + size, len(self.buf))
+        start = self.pos
+        self.pos = end
+        return  self.buf[start:end]
+
+    def readinto(self, b: bytearray) -> int:
+        n = len(b)
+        remaining = len(self.buf) - self.pos
+        if remaining < n:
+            n = remaining
+        b[:n] = self.buf[self.pos:self.pos + n]
+        self.pos += n
+        return n
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:  # SEEK_SET
+            self.pos = offset
+        elif whence == 1:  # SEEK_CUR
+            self.pos += offset
+        elif whence == 2:  # SEEK_END
+            self.pos = len(self.buf) + offset
+        return self.pos
+
+    def tell(self) -> int:
+        return self.pos
+
+
+class _ReaderView(io.IOBase):
+    def __init__(self, base_stream: S3Reader, offset: int, len: int):
+        super().__init__()
+        self.offset = offset
+        self.len = len
+        self.base_stream = base_stream
+        self.seek(0)
+
+    def seek(self, __offset: int, __whence: int = os.SEEK_SET) -> int:
+        if __whence == os.SEEK_SET:
+            __offset = self.offset + __offset
+        elif __whence == os.SEEK_END:
+            __whence = os.SEEK_SET
+            __offset = (self.offset + self.len) - __offset
+        return self.base_stream.seek(__offset, __whence)
+
+    def tell(self) -> int:
+        return self.base_stream.tell() - self.offset
+
+    def readable(self) -> bool:
+        return self.base_stream.readable()
+
+    def seekable(self) -> bool:
+        return self.base_stream.seekable()
+
+    def readinto(self, b):
+        return self.base_stream.readinto(b)  # type: ignore[attr-defined]
+
+    def read(self, size=-1):
+        return self.base_stream.read(size)
+
+    def read1(self, size=-1):
+        return self.base_stream.read1(size)
+
+
 
 class S3StorageReader(FileSystemReader):
     def __init__(
@@ -341,6 +418,77 @@ class S3StorageReader(FileSystemReader):
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
         return S3FileSystem.validate_checkpoint_id(checkpoint_id)
+
+    def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
+        # return super().read_data(plan, planner)
+
+        # group requests by file
+        # print(f"read_data for {self.path}")
+        per_file: Dict[str, List[ReadItem]] = dict()
+        for read_item in plan.items:
+            item_md = self.storage_data[read_item.storage_index]
+            path = item_md.relative_path
+            if path not in per_file:
+                per_file[path] = []
+            # print(f"{path} - {item_md.offset} / {item_md.length}")
+            heapq.heappush(per_file[path], (item_md.offset, read_item))
+
+        for relative_path, reqs in per_file.items():
+            new_path = self.fs.concat_path(self.path, relative_path)
+            pref_offset = 0
+            with self.fs.create_stream(new_path, "rb") as stream:
+                # Process requests in order of storage_offset
+                while reqs:
+                    cur_offset, req = heapq.heappop(reqs)
+
+                    item_md = self.storage_data[req.storage_index]
+                    assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
+                    assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
+                    pref_offset = cur_offset
+
+                    # print(f"gonna read {new_path} starting from {item_md.offset}")
+                    # file_slice = self._slice_file(stream, item_md)
+                    file_slice = _ReaderView(stream, item_md.offset, item_md.length)
+                    if req.type == LoadItemType.BYTE_IO:
+                        # read_bytes = io.BytesIO(file_slice.read(item_md.length))
+                        read_bytes = file_slice.read1(item_md.length)
+                        read_bytes.seek(0)
+                        planner.load_bytes(req, read_bytes)
+                    else:
+                        tensor = cast(
+                            Tensor,
+                            torch.load(
+                                cast(IO[bytes], file_slice.read1(item_md.length)),
+                                map_location="cpu",
+                                weights_only=True,
+                            ),
+                        )
+                        # bytes_io = io.BytesIO(b'\0' * item_md.length)  # single allocation
+                        # file_slice.readinto(bytes_io.getbuffer())  # direct read into BytesIO's buffer
+                        # bytes_io.seek(0)  # reset position for reading
+                        # tensor = cast(
+                        #     Tensor,
+                        #     torch.load(
+                        #         bytes_io,
+                        #         map_location="cpu",
+                        #         weights_only=True,
+                        #     ),
+                        # )
+                        tensor = narrow_tensor_by_index(
+                            tensor, req.storage_offsets, req.lengths
+                        )
+                        target_tensor = planner.resolve_tensor(req).detach()
+
+                        assert (
+                            target_tensor.size() == tensor.size()
+                        ), f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                        target_tensor.copy_(tensor)
+                        planner.commit_tensor(req, target_tensor)
+        fut: Future = Future()
+        fut.set_result(None)
+        return fut
+
+
 
 
 def _path_or_str_to_str(path: Union[str, os.PathLike]) -> str:
