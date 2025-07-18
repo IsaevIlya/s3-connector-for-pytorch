@@ -1,13 +1,13 @@
 #  Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #  // SPDX-License-Identifier: BSD
-
+import contextlib
 import io
 import logging
 import os
 import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Union, Optional
+from typing import Generator, Union, Optional, Tuple
 from typing import List
 
 from s3torchconnectorclient._mountpoint_s3_client import S3Exception
@@ -320,6 +320,8 @@ from torch.distributed.checkpoint.planner import LoadPlan, LoadPlanner, ReadItem
 from torch import Tensor
 from torch.distributed._shard._utils import narrow_tensor_by_index
 import heapq
+import concurrent.futures
+from dataclasses import dataclass
 
 class ByteArrayIO:
     def __init__(self, buf: bytearray):
@@ -391,6 +393,13 @@ class _ReaderView(io.IOBase):
         return self.base_stream.read1(size)
 
 
+@dataclass
+class BucketInfo:
+    items: List[Tuple[int, ReadItem]]
+    start_offset: int
+    end_offset: int
+    total_size: int
+
 
 class S3StorageReader(FileSystemReader):
     def __init__(
@@ -419,11 +428,65 @@ class S3StorageReader(FileSystemReader):
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
         return S3FileSystem.validate_checkpoint_id(checkpoint_id)
 
+    def _create_buckets(self, heap_items: List[Tuple[int, ReadItem]], num_buckets: int) -> List[BucketInfo]:
+        # Calculate total size
+        total_size = sum(self.storage_data[item[1].storage_index].length for item in heap_items)
+        target_bucket_size = total_size / num_buckets
+
+        # Create buckets with approximately equal total size
+        buckets: List[BucketInfo] = []
+        current_items: List[Tuple[int, ReadItem]] = []
+        current_size = 0
+
+        while heap_items:
+            item = heapq.heappop(heap_items)
+            item_md = self.storage_data[item[1].storage_index]
+            item_size = item_md.length
+
+            current_items.append(item)
+            current_size += item_size
+
+            if current_size >= target_bucket_size and len(buckets) < num_buckets - 1:
+                # Calculate bucket range
+                first_item_md = self.storage_data[current_items[0][1].storage_index]
+                last_item_md = self.storage_data[current_items[-1][1].storage_index]
+                start_offset = first_item_md.offset
+                end_offset = last_item_md.offset + last_item_md.length
+
+                buckets.append(BucketInfo(
+                    items=current_items,
+                    start_offset=start_offset,
+                    end_offset=end_offset,
+                    total_size=current_size
+                ))
+
+                # Reset for next bucket
+                current_items = []
+                current_size = 0
+
+        # Handle the last bucket if there are remaining items
+        if current_items:
+            first_item_md = self.storage_data[current_items[0][1].storage_index]
+            last_item_md = self.storage_data[current_items[-1][1].storage_index]
+            start_offset = first_item_md.offset
+            end_offset = last_item_md.offset + last_item_md.length
+
+            buckets.append(BucketInfo(
+                items=current_items,
+                start_offset=start_offset,
+                end_offset=end_offset,
+                total_size=current_size
+            ))
+
+        return buckets
+
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        # return super().read_data(plan, planner)
+        return super().read_data(plan, planner)
+
+        NUM_PARALLEL_STREAMS = 10
 
         # group requests by file
-        # print(f"read_data for {self.path}")
+        # print(f"read_data for {self.path} =================================")
         per_file: Dict[str, List[ReadItem]] = dict()
         for read_item in plan.items:
             item_md = self.storage_data[read_item.storage_index]
@@ -435,55 +498,65 @@ class S3StorageReader(FileSystemReader):
 
         for relative_path, reqs in per_file.items():
             new_path = self.fs.concat_path(self.path, relative_path)
-            pref_offset = 0
-            with self.fs.create_stream(new_path, "rb") as stream:
-                # Process requests in order of storage_offset
-                while reqs:
-                    cur_offset, req = heapq.heappop(reqs)
+            # Split requests into buckets
+            buckets = self._create_buckets(reqs, NUM_PARALLEL_STREAMS)
 
-                    item_md = self.storage_data[req.storage_index]
-                    assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
-                    assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
-                    pref_offset = cur_offset
+            def process_bucket(bucket_idx: int, bucket: BucketInfo):
+                with self.fs.create_stream(new_path, "rb") as stream:
+                    # Use pre-calculated ranges
+                    stream.seek(bucket.start_offset)
+                    length = bucket.end_offset - bucket.start_offset
+                    stream.prefetch(length)
 
-                    # print(f"gonna read {new_path} starting from {item_md.offset}")
-                    # file_slice = self._slice_file(stream, item_md)
-                    file_slice = _ReaderView(stream, item_md.offset, item_md.length)
-                    if req.type == LoadItemType.BYTE_IO:
-                        # read_bytes = io.BytesIO(file_slice.read(item_md.length))
-                        read_bytes = file_slice.read1(item_md.length)
-                        read_bytes.seek(0)
-                        planner.load_bytes(req, read_bytes)
-                    else:
-                        tensor = cast(
-                            Tensor,
-                            torch.load(
-                                cast(IO[bytes], file_slice.read1(item_md.length)),
-                                map_location="cpu",
-                                weights_only=True,
-                            ),
-                        )
-                        # bytes_io = io.BytesIO(b'\0' * item_md.length)  # single allocation
-                        # file_slice.readinto(bytes_io.getbuffer())  # direct read into BytesIO's buffer
-                        # bytes_io.seek(0)  # reset position for reading
-                        # tensor = cast(
-                        #     Tensor,
-                        #     torch.load(
-                        #         bytes_io,
-                        #         map_location="cpu",
-                        #         weights_only=True,
-                        #     ),
-                        # )
-                        tensor = narrow_tensor_by_index(
-                            tensor, req.storage_offsets, req.lengths
-                        )
-                        target_tensor = planner.resolve_tensor(req).detach()
+                    pref_offset = bucket.start_offset
 
-                        assert (
-                            target_tensor.size() == tensor.size()
-                        ), f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
-                        target_tensor.copy_(tensor)
-                        planner.commit_tensor(req, target_tensor)
+                    for cur_offset, req in bucket.items:
+                        item_md = self.storage_data[req.storage_index]
+                        assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
+                        assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
+                        pref_offset = cur_offset
+                        assert (item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
+                        assert (item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
+                        file_slice = _ReaderView(stream, item_md.offset, item_md.length)
+                        if req.type == LoadItemType.BYTE_IO:
+                            read_bytes = file_slice.read1(item_md.length)
+                            read_bytes.seek(0)
+                            planner.load_bytes(req, read_bytes)
+                        else:
+                            tensor = cast(
+                                Tensor,
+                                torch.load(
+                                    cast(IO[bytes], file_slice.read1(item_md.length)),
+                                    map_location="cpu",
+                                    weights_only=True,
+                                ),
+                            )
+                            tensor = narrow_tensor_by_index(
+                                tensor, req.storage_offsets, req.lengths
+                            )
+                            target_tensor = planner.resolve_tensor(req).detach()
+
+                            assert (
+                                    target_tensor.size() == tensor.size()
+                            ), f"req {req.storage_index} mismatch sizes {target_tensor.size()} vs {tensor.size()}"
+                            target_tensor.copy_(tensor)
+                            planner.commit_tensor(req, target_tensor)
+
+            # Use ThreadPoolExecutor to process buckets in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PARALLEL_STREAMS) as executor:
+                futures = []
+                for i, bucket in enumerate(buckets):
+                    if bucket:  # Only process non-empty buckets
+                        future = executor.submit(process_bucket, i, bucket)
+                        futures.append(future)
+
+                # Wait for all futures to complete
+                concurrent.futures.wait(futures)
+
+                # Check for exceptions
+                for future in futures:
+                    future.result()  # This will raise any exceptions that occurred
+
         fut: Future = Future()
         fut.set_result(None)
         return fut
