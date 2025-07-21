@@ -253,7 +253,7 @@ class S3FileSystem(FileSystemBase):
         return "/".join(parts)
 
 
-from torch.distributed.checkpoint.planner import SavePlan
+from torch.distributed.checkpoint.planner import SavePlan, WriteItem
 import dataclasses
 from dataclasses import dataclass
 
@@ -264,6 +264,22 @@ class StorageMetadata:
 
     prefix: str
 
+
+from torch.distributed.checkpoint.filesystem import _split_by_size_and_type as original_split
+
+def _ordered_split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
+    buckets = original_split(bins, items)
+    for bucket in buckets:
+        bucket.sort(key=lambda item: item.index.fqn)
+    print("****************REORDER TENSORS**************************")
+    return buckets
+
+# Replace the original function
+# Import the module where the function is used
+import torch.distributed.checkpoint.filesystem as fs_module
+
+# Replace the original function with our new one
+fs_module._split_by_size_and_type = _ordered_split_by_size_and_type
 
 class S3StorageWriter(FileSystemWriter):
     def __init__(
