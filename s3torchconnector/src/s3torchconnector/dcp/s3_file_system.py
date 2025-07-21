@@ -4,6 +4,7 @@ import contextlib
 import io
 import logging
 import os
+import time
 import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
@@ -322,6 +323,8 @@ from torch.distributed._shard._utils import narrow_tensor_by_index
 import heapq
 import concurrent.futures
 from dataclasses import dataclass
+from queue import Queue
+from threading import Lock
 
 class ByteArrayIO:
     def __init__(self, buf: bytearray):
@@ -400,7 +403,6 @@ class BucketInfo:
     end_offset: int
     total_size: int
 
-
 class S3StorageReader(FileSystemReader):
     def __init__(
         self,
@@ -423,77 +425,72 @@ class S3StorageReader(FileSystemReader):
         self.fs = S3FileSystem(region, s3client_config=s3client_config, reader_constructor=reader_constructor)  # type: ignore
         self.path = self.fs.init_path(path)
         self.sync_files = False
+        self.GAP_THRESHOLD = 1024
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
         return S3FileSystem.validate_checkpoint_id(checkpoint_id)
 
     def _create_buckets(self, heap_items: List[Tuple[int, ReadItem]], num_buckets: int) -> List[BucketInfo]:
-        # Calculate total size
-        total_size = sum(self.storage_data[item[1].storage_index].length for item in heap_items)
-        target_bucket_size = total_size / num_buckets
-
-        # Create buckets with approximately equal total size
         buckets: List[BucketInfo] = []
         current_items: List[Tuple[int, ReadItem]] = []
         current_size = 0
+        last_end = None
+        total_size = sum(self.storage_data[item[1].storage_index].length for item in heap_items)
+        target_bucket_size = total_size / num_buckets
 
         while heap_items:
             item = heapq.heappop(heap_items)
             item_md = self.storage_data[item[1].storage_index]
             item_size = item_md.length
 
+            # Check if there's a large gap
+            if current_size >= target_bucket_size or last_end is not None and (item_md.offset - last_end) > self.GAP_THRESHOLD:
+            # if last_end is not None and (
+            #         item_md.offset - last_end) > self.GAP_THRESHOLD:
+                if current_items:
+                    print(f"creating a new bucket, gap size is {item_md.offset - last_end}")
+                    # Create a bucket for items before the gap
+                    first_item_md = self.storage_data[current_items[0][1].storage_index]
+                    last_item_md = self.storage_data[current_items[-1][1].storage_index]
+                    buckets.append(BucketInfo(
+                        items=current_items,
+                        start_offset=first_item_md.offset,
+                        end_offset=last_item_md.offset + last_item_md.length,
+                        total_size=current_size
+                    ))
+                    current_items = []
+                    current_size = 0
+
             current_items.append(item)
             current_size += item_size
+            last_end = item_md.offset + item_md.length
 
-            if current_size >= target_bucket_size and len(buckets) < num_buckets - 1:
-                # Calculate bucket range
-                first_item_md = self.storage_data[current_items[0][1].storage_index]
-                last_item_md = self.storage_data[current_items[-1][1].storage_index]
-                start_offset = first_item_md.offset
-                end_offset = last_item_md.offset + last_item_md.length
-
-                buckets.append(BucketInfo(
-                    items=current_items,
-                    start_offset=start_offset,
-                    end_offset=end_offset,
-                    total_size=current_size
-                ))
-
-                # Reset for next bucket
-                current_items = []
-                current_size = 0
-
-        # Handle the last bucket if there are remaining items
+        # Handle remaining items
         if current_items:
             first_item_md = self.storage_data[current_items[0][1].storage_index]
             last_item_md = self.storage_data[current_items[-1][1].storage_index]
-            start_offset = first_item_md.offset
-            end_offset = last_item_md.offset + last_item_md.length
-
             buckets.append(BucketInfo(
                 items=current_items,
-                start_offset=start_offset,
-                end_offset=end_offset,
+                start_offset=first_item_md.offset,
+                end_offset=last_item_md.offset + last_item_md.length,
                 total_size=current_size
             ))
 
+        print(f"creating new buckets #{len(buckets)}")
         return buckets
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        return super().read_data(plan, planner)
+        # return super().read_data(plan, planner)
 
         NUM_PARALLEL_STREAMS = 10
 
-        # group requests by file
-        # print(f"read_data for {self.path} =================================")
         per_file: Dict[str, List[ReadItem]] = dict()
         for read_item in plan.items:
             item_md = self.storage_data[read_item.storage_index]
             path = item_md.relative_path
             if path not in per_file:
                 per_file[path] = []
-            # print(f"{path} - {item_md.offset} / {item_md.length}")
             heapq.heappush(per_file[path], (item_md.offset, read_item))
 
         for relative_path, reqs in per_file.items():
@@ -501,22 +498,34 @@ class S3StorageReader(FileSystemReader):
             # Split requests into buckets
             buckets = self._create_buckets(reqs, NUM_PARALLEL_STREAMS)
 
-            def process_bucket(bucket_idx: int, bucket: BucketInfo):
+            # Create a queue of buckets to process
+            bucket_queue = Queue()
+            for bucket in buckets:
+                bucket_queue.put(bucket)
+
+            # Keep track of active futures
+            active_futures: Dict[Future, None] = {}
+            futures_lock = Lock()
+            all_done = False
+
+            def process_bucket(bucket: BucketInfo):
                 with self.fs.create_stream(new_path, "rb") as stream:
-                    # Use pre-calculated ranges
                     stream.seek(bucket.start_offset)
                     length = bucket.end_offset - bucket.start_offset
                     stream.prefetch(length)
 
                     pref_offset = bucket.start_offset
-
                     for cur_offset, req in bucket.items:
                         item_md = self.storage_data[req.storage_index]
                         assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
-                        assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
+                        assert (
+                                    cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
                         pref_offset = cur_offset
-                        assert (item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
-                        assert (item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
+                        assert (
+                                    item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
+                        assert (
+                                    item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
+
                         file_slice = _ReaderView(stream, item_md.offset, item_md.length)
                         if req.type == LoadItemType.BYTE_IO:
                             read_bytes = file_slice.read1(item_md.length)
@@ -542,20 +551,44 @@ class S3StorageReader(FileSystemReader):
                             target_tensor.copy_(tensor)
                             planner.commit_tensor(req, target_tensor)
 
-            # Use ThreadPoolExecutor to process buckets in parallel
+            def future_done_callback(future: Future):
+                with futures_lock:
+                    # Remove the completed future
+                    active_futures.pop(future)
+
+                    if not all_done:
+                        try:
+                            # Get next bucket if available
+                            next_bucket = bucket_queue.get_nowait()
+                            # Submit new task
+                            new_future = executor.submit(process_bucket, next_bucket)
+                            active_futures[new_future] = None
+                            new_future.add_done_callback(future_done_callback)
+                        except Exception:
+                            # No more buckets to process
+                            pass
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PARALLEL_STREAMS) as executor:
-                futures = []
-                for i, bucket in enumerate(buckets):
-                    if bucket:  # Only process non-empty buckets
-                        future = executor.submit(process_bucket, i, bucket)
-                        futures.append(future)
+                # Initial submission of tasks up to NUM_PARALLEL_STREAMS
+                for _ in range(min(NUM_PARALLEL_STREAMS, len(buckets))):
+                    bucket = bucket_queue.get()
+                    future = executor.submit(process_bucket, bucket)
+                    active_futures[future] = None
+                    future.add_done_callback(future_done_callback)
 
-                # Wait for all futures to complete
-                concurrent.futures.wait(futures)
+                # Wait for all tasks to complete
+                while True:
+                    with futures_lock:
+                        if not active_futures and bucket_queue.empty():
+                            break
+                    time.sleep(0.001)  # Small sleep to prevent busy waiting
 
-                # Check for exceptions
-                for future in futures:
-                    future.result()  # This will raise any exceptions that occurred
+                # Mark as done to prevent new submissions
+                all_done = True
+
+                # Check for any exceptions
+                for future in concurrent.futures.as_completed(active_futures):
+                    future.result()  # Will raise any exceptions that occurred
 
         fut: Future = Future()
         fut.set_result(None)

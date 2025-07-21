@@ -78,7 +78,7 @@ class VirtualRegexContainer:
         self.regex = re.compile(regex)
 
     def __contains__(self, item: str) -> bool:
-        print(f"Item name: {item}")
+        # print(f"Item name: {item}")
         verdict = self.regex.search(item) is not None
         if not verdict:
             print(f"Skipping {item}")
@@ -215,13 +215,14 @@ def run_fsdp(
             device=torch.device("cpu"), recurse=False
         )
 
+    # =======================================
     # if checkpoint_sharding_strategy == "full":
     #     sharding_strategy = ShardingStrategy.FULL_SHARD
     # elif checkpoint_sharding_strategy == "hybrid":
     #     sharding_strategy = ShardingStrategy.HYBRID_SHARD
     # else:
     #     raise NotImplementedError("Available sharding strategies are full and hybrid")
-
+    #
     # model = FSDP(
     #     model,
     #     auto_wrap_policy=gpt_auto_wrap_policy,
@@ -253,11 +254,14 @@ def run_fsdp(
     #
     # dist.barrier()
     # end_save = perf_counter()
-
+    #
     # if rank == 0:
     #     print(f"The total size of model is {model_size}")
     #     print(f"Time taken to save: {end_save - begin_save} seconds")
-    # Record the save times excluding the influence of the process setup and model loading to device.
+    # # Record the save times excluding the influence of the process setup and model loading to device.
+    # return
+
+
 
     storage_reader = get_reader(region, uri, suffix)
     # empty_stat_dict = {"model": None}
@@ -268,7 +272,8 @@ def run_fsdp(
     #     {
     #     "model": None
     # }
-    keys_regex = None if not model_only else VirtualRegexContainer("^model\\.*")
+    # keys_regex = None if not model_only else VirtualRegexContainer("^model\\.*")
+    keys_regex = None if not model_only else VirtualRegexContainer("^model\\.model\\.layers\\.[13][13579]")
     load_planner = _EmptyStateDictLoadPlanner(keys=keys_regex)
     _load_state_dict(
         sd_out,
@@ -284,22 +289,23 @@ def run_fsdp(
     if rank == 0:
         print(f"Time taken to load: {end_load - start_load} seconds")
 
-    dist.destroy_process_group()
+    # dist.destroy_process_group()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", type=str, default="nccl", choices=["nccl", "gloo"])
     parser.add_argument("--thread_count", type=int, default=1)
-    parser.add_argument("--region", type=str, default="us-east-1")
+    parser.add_argument("--region", type=str, default="eu-north-1")
     parser.add_argument("--uri", type=str)
     args = parser.parse_args()
 
     backend = args.backend
-    dist.init_process_group(backend)
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    print(f"Starting for rank {rank}, world_size is {world_size}")
+    # dist.init_process_group(backend)
+    # rank = dist.get_rank()
+    # world_size = dist.get_world_size()
+    # print(f"Starting for rank {rank}, world_size is {world_size}")
+    rank, world_size = 0, 1
     thread_count = args.thread_count
 
     region = args.region
