@@ -61,12 +61,14 @@ def get_writer(region:str, uri: str, suffix: str, thread_count: int = 8) -> File
     logger.info("Saving checkpoint to %s (S3)...", uri)
     return S3StorageWriter(region, uri, thread_count=thread_count)
 
-def get_reader(region:str, uri: str, suffix: str) -> FileSystemReader:
+def get_reader(region:str, uri: str, suffix: str, seq: bool, use_custom_load: bool) -> FileSystemReader:
     uri = build_checkpoint_uri(uri, suffix)
     logger.info("Loading checkpoint from %s (S3)...", uri)
-    # reader_constructor = S3ReaderConstructor.sequential()
-    reader_constructor = S3ReaderConstructor.range_based(1*1024*1024)
-    return S3StorageReader(region, uri, reader_constructor=reader_constructor)
+    if seq:
+        reader_constructor = S3ReaderConstructor.sequential()
+    else:
+        reader_constructor = S3ReaderConstructor.range_based(1*1024*1024)
+    return S3StorageReader(region, uri, reader_constructor=reader_constructor, use_custom_load=use_custom_load)
 
 import re
 # from torch.distributed.checkpoint.default_planner import _EmptyStateDictLoadPlanner
@@ -156,7 +158,21 @@ class _EmptyStateDictLoadPlanner(DefaultLoadPlanner):
 
         super().set_up_planner(state_dict, metadata, is_coordinator)
 
+def _compare_models(model1, st_dict2, keys_regex, rtol=1e-5, atol=1e-8):
+    for key_1, item_1 in model1.items():
+        if key_1 not in keys_regex:
+            continue
 
+        item_2 = st_dict2[key_1]
+        if not torch.allclose(item_1, item_2, rtol=rtol, atol=atol):
+            print(f"Key {key_1} is not equal")
+            print(item_1)
+            print(item_2)
+            # return False
+        else:
+            print(f"Key {key_1} is equal")
+    print("No difference")
+    return True
 
 def run_fsdp(
     rank: int,  # needs to be passed first (provided by `multiprocessing.spawn` automatically)
@@ -174,48 +190,48 @@ def run_fsdp(
     This function is meant to be executed in subprocesses."""
     # setup(backend=backend, world_size=world_size, rank=rank)
 
-    if rank == 0:
-        logger.info("Creating Model")
-    # Instantiate model on CPU on rank=0 only to prevent CPU OOM
-    # (e.g. 70B * 4 bytes * 8 processes > 2T RAM available on P5)
-    if rank == 0:
-        model_proxy = get_benchmark_model(model_name)
-        model = model_proxy.model
-    else:
-        with torch.device("meta"):
-            # Instantiating model on `meta` device doesn't consume CPU memory,
-            # but requires specifing `param_init_fn=...`
-            # and `sync_module_states=True` in FSDP c-tor.
-            model_proxy = get_benchmark_model(model_name)
-            model = model_proxy.model
+    # if rank == 0:
+    #     logger.info("Creating Model")
+    # # Instantiate model on CPU on rank=0 only to prevent CPU OOM
+    # # (e.g. 70B * 4 bytes * 8 processes > 2T RAM available on P5)
+    # if rank == 0:
+    #     model_proxy = get_benchmark_model(model_name)
+    #     model = model_proxy.model
+    # else:
+    #     with torch.device("meta"):
+    #         # Instantiating model on `meta` device doesn't consume CPU memory,
+    #         # but requires specifing `param_init_fn=...`
+    #         # and `sync_module_states=True` in FSDP c-tor.
+    #         model_proxy = get_benchmark_model(model_name)
+    #         model = model_proxy.model
+    #
+    # model_size = model_proxy.size
+    # model_name = model_proxy.name
+    # if rank == 0:
+    #     logger.info(f"Model {model_name} created")
+    #
+    # transformer_layer = LlamaDecoderLayer
+    # gpt_auto_wrap_policy = functools.partial(
+    #     transformer_auto_wrap_policy,
+    #     transformer_layer_cls={
+    #         transformer_layer,
+    #     },
+    # )
+    #
+    # if backend == "nccl":
+    #     device_id = rank % torch.cuda.device_count()
+    #     torch.cuda.set_device(device_id)
+    #     param_init_fn = lambda module: module.to_empty(
+    #         device=torch.device("cuda"), recurse=False
+    #     )
+    # else:
+    #     device_id = rank % torch.cpu.device_count()
+    #     torch.cpu.set_device(device_id)
+    #     param_init_fn = lambda module: module.to_empty(
+    #         device=torch.device("cpu"), recurse=False
+    #     )
 
-    model_size = model_proxy.size
-    model_name = model_proxy.name
-    if rank == 0:
-        logger.info(f"Model {model_name} created")
-
-    transformer_layer = LlamaDecoderLayer
-    gpt_auto_wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls={
-            transformer_layer,
-        },
-    )
-
-    if backend == "nccl":
-        device_id = rank % torch.cuda.device_count()
-        torch.cuda.set_device(device_id)
-        param_init_fn = lambda module: module.to_empty(
-            device=torch.device("cuda"), recurse=False
-        )
-    else:
-        device_id = rank % torch.cpu.device_count()
-        torch.cpu.set_device(device_id)
-        param_init_fn = lambda module: module.to_empty(
-            device=torch.device("cpu"), recurse=False
-        )
-
-    # =======================================
+    # # =======================================
     # if checkpoint_sharding_strategy == "full":
     #     sharding_strategy = ShardingStrategy.FULL_SHARD
     # elif checkpoint_sharding_strategy == "hybrid":
@@ -261,34 +277,39 @@ def run_fsdp(
     # # Record the save times excluding the influence of the process setup and model loading to device.
     # return
 
-
-
-    storage_reader = get_reader(region, uri, suffix)
     # empty_stat_dict = {"model": None}
-    start_load = perf_counter()
     # dcp.load(state_dict, storage_reader=storage_reader)
-    model_only = True
-    sd_out: STATE_DICT_TYPE = {}
-    #     {
-    #     "model": None
-    # }
-    # keys_regex = None if not model_only else VirtualRegexContainer("^model\\.*")
-    keys_regex = None if not model_only else VirtualRegexContainer("^model\\.model\\.layers\\.[13][13579]")
-    load_planner = _EmptyStateDictLoadPlanner(keys=keys_regex)
-    _load_state_dict(
-        sd_out,
-        storage_reader,
-        planner=load_planner,
-        no_dist=True,
-    )
-
     # dcp.load(sd_out, storage_reader=storage_reader)
 
-    end_load = perf_counter()
+    def load_model(model_only: bool, seq: bool, use_custom_load: bool):
+        storage_reader = get_reader(region, uri, suffix, True, use_custom_load)
 
-    if rank == 0:
-        print(f"Time taken to load: {end_load - start_load} seconds")
+        start_load = perf_counter()
+        sd_out: STATE_DICT_TYPE = {}
+        # {
+        #     "model": None
+        # }
+        # keys_regex = None if not model_only else VirtualRegexContainer("^model\\.*")
+        keys_regex = None if not model_only else VirtualRegexContainer("^model\\.model\\.layers\\.[13][13579]")
+        load_planner = _EmptyStateDictLoadPlanner(keys=keys_regex)
+        _load_state_dict(
+            sd_out,
+            storage_reader,
+            planner=load_planner,
+            no_dist=True,
+        )
 
+        end_load = perf_counter()
+
+        if rank == 0:
+            print(f"Time taken to load: {end_load - start_load} seconds")
+        return sd_out
+
+    model_only = True
+    seq_model = load_model(model_only, True, False)
+    range_model = load_model(model_only,False, True)
+    keys_regex_for_dictionary = None if not model_only else VirtualRegexContainer("^model\\.layers\\.[13][13579]")
+    _compare_models(seq_model["model"], range_model["model"], keys_regex_for_dictionary)
     # dist.destroy_process_group()
 
 
@@ -306,10 +327,12 @@ if __name__ == "__main__":
     # world_size = dist.get_world_size()
     # print(f"Starting for rank {rank}, world_size is {world_size}")
     rank, world_size = 0, 1
+    setup("gloo", 1, 0)
     thread_count = args.thread_count
 
     region = args.region
     uri = args.uri
-    suffix = "experiment"
+    suffix = "experiment_ordered"
+    suffix = "experiment_27"
     checkpoint_sharding_strategy = "hybrid"
     run_fsdp(rank, world_size, thread_count, backend, region, uri, suffix, checkpoint_sharding_strategy=checkpoint_sharding_strategy)

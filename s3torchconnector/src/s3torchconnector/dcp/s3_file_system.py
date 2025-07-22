@@ -265,21 +265,23 @@ class StorageMetadata:
     prefix: str
 
 
-from torch.distributed.checkpoint.filesystem import _split_by_size_and_type as original_split
 
-def _ordered_split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
-    buckets = original_split(bins, items)
-    for bucket in buckets:
-        bucket.sort(key=lambda item: item.index.fqn)
-    print("****************REORDER TENSORS**************************")
-    return buckets
 
-# Replace the original function
-# Import the module where the function is used
-import torch.distributed.checkpoint.filesystem as fs_module
-
-# Replace the original function with our new one
-fs_module._split_by_size_and_type = _ordered_split_by_size_and_type
+# from torch.distributed.checkpoint.filesystem import _split_by_size_and_type as original_split
+#
+# def _ordered_split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
+#     buckets = original_split(bins, items)
+#     for bucket in buckets:
+#         bucket.sort(key=lambda item: item.index.fqn)
+#     print("****************REORDER TENSORS**************************")
+#     return buckets
+#
+# # Replace the original function
+# # Import the module where the function is used
+# import torch.distributed.checkpoint.filesystem as fs_module
+#
+# # Replace the original function with our new one
+# fs_module._split_by_size_and_type = _ordered_split_by_size_and_type
 
 class S3StorageWriter(FileSystemWriter):
     def __init__(
@@ -426,6 +428,7 @@ class S3StorageReader(FileSystemReader):
         path: Union[str, os.PathLike],
         s3client_config: Optional[S3ClientConfig] = None,
         reader_constructor: Optional[S3ReaderConstructorProtocol] = None,
+        use_custom_load: bool = False
     ) -> None:
         """
         Initialize an S3 reader for distributed checkpointing.
@@ -442,6 +445,7 @@ class S3StorageReader(FileSystemReader):
         self.path = self.fs.init_path(path)
         self.sync_files = False
         self.GAP_THRESHOLD = 1024
+        self.use_custom_load = use_custom_load
 
     @classmethod
     def validate_checkpoint_id(cls, checkpoint_id: Union[str, os.PathLike]) -> bool:
@@ -456,9 +460,11 @@ class S3StorageReader(FileSystemReader):
         target_bucket_size = total_size / num_buckets
 
         while heap_items:
-            item = heapq.heappop(heap_items)
-            item_md = self.storage_data[item[1].storage_index]
+            offset, item = heapq.heappop(heap_items)
+            item_md = self.storage_data[item.storage_index]
             item_size = item_md.length
+
+            print(f"dest {item.dest_index.fqn} \t\t storage {item.storage_index.fqn} \t\t offset {offset}")
 
             # Check if there's a large gap
             if current_size >= target_bucket_size or last_end is not None and (item_md.offset - last_end) > self.GAP_THRESHOLD:
@@ -467,8 +473,8 @@ class S3StorageReader(FileSystemReader):
                 if current_items:
                     print(f"creating a new bucket, gap size is {item_md.offset - last_end}")
                     # Create a bucket for items before the gap
-                    first_item_md = self.storage_data[current_items[0][1].storage_index]
-                    last_item_md = self.storage_data[current_items[-1][1].storage_index]
+                    first_item_md = self.storage_data[current_items[0].storage_index]
+                    last_item_md = self.storage_data[current_items[-1].storage_index]
                     buckets.append(BucketInfo(
                         items=current_items,
                         start_offset=first_item_md.offset,
@@ -484,8 +490,8 @@ class S3StorageReader(FileSystemReader):
 
         # Handle remaining items
         if current_items:
-            first_item_md = self.storage_data[current_items[0][1].storage_index]
-            last_item_md = self.storage_data[current_items[-1][1].storage_index]
+            first_item_md = self.storage_data[current_items[0].storage_index]
+            last_item_md = self.storage_data[current_items[-1].storage_index]
             buckets.append(BucketInfo(
                 items=current_items,
                 start_offset=first_item_md.offset,
@@ -497,9 +503,12 @@ class S3StorageReader(FileSystemReader):
         return buckets
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:
-        # return super().read_data(plan, planner)
+        if not self.use_custom_load:
+            print("Using default load strategy.-----------------------------------")
+            return super().read_data(plan, planner)
 
-        NUM_PARALLEL_STREAMS = 10
+        print("Using CUSTOM load strategy.-----------------------------------")
+        NUM_PARALLEL_STREAMS = 1
 
         per_file: Dict[str, List[ReadItem]] = dict()
         for read_item in plan.items:
@@ -534,13 +543,10 @@ class S3StorageReader(FileSystemReader):
                     for cur_offset, req in bucket.items:
                         item_md = self.storage_data[req.storage_index]
                         assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
-                        assert (
-                                    cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
+                        assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
                         pref_offset = cur_offset
-                        assert (
-                                    item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
-                        assert (
-                                    item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
+                        assert (item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
+                        assert (item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
 
                         file_slice = _ReaderView(stream, item_md.offset, item_md.length)
                         if req.type == LoadItemType.BYTE_IO:
