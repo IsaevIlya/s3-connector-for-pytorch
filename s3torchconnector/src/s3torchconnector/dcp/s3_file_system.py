@@ -8,7 +8,7 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Union, Optional, Tuple
+from typing import Generator, Union, Optional, Tuple, Set
 from typing import List
 
 from s3torchconnectorclient._mountpoint_s3_client import S3Exception
@@ -387,13 +387,13 @@ class _ReaderView(io.IOBase):
         self.base_stream = base_stream
         self.seek(0)
 
-    def seek(self, __offset: int, __whence: int = os.SEEK_SET) -> int:
-        if __whence == os.SEEK_SET:
-            __offset = self.offset + __offset
-        elif __whence == os.SEEK_END:
-            __whence = os.SEEK_SET
-            __offset = (self.offset + self.len) - __offset
-        return self.base_stream.seek(__offset, __whence)
+    def seek(self, offset: int, whence: int = os.SEEK_SET, /) -> int:
+        if whence == os.SEEK_SET:
+            offset = self.offset + offset
+        elif whence == os.SEEK_END:
+            whence = os.SEEK_SET
+            offset = (self.offset + self.len) - offset
+        return self.base_stream.seek(offset, whence)
 
     def tell(self) -> int:
         return self.base_stream.tell() - self.offset
@@ -405,18 +405,32 @@ class _ReaderView(io.IOBase):
         return self.base_stream.seekable()
 
     def readinto(self, b):
+        max_size = self.len - self.tell()
+        if max_size == 0:
+            return 0
+        if len(b) > max_size:
+            b = memoryview(b)[:max_size]
         return self.base_stream.readinto(b)  # type: ignore[attr-defined]
 
     def read(self, size=-1):
+        max_size = self.len - self.tell()
+        if size == -1 or size > max_size:
+            size = max_size
         return self.base_stream.read(size)
 
     def read1(self, size=-1):
+        max_size = self.len - self.tell()
+        if size == -1 or size > max_size:
+            size = max_size
         return self.base_stream.read1(size)
+
+    def prefetch(self, size):
+        self.base_stream.prefetch(size)
 
 
 @dataclass
 class BucketInfo:
-    items: List[Tuple[int, ReadItem]]
+    items: List[ReadItem]
     start_offset: int
     end_offset: int
     total_size: int
@@ -444,7 +458,7 @@ class S3StorageReader(FileSystemReader):
         self.fs = S3FileSystem(region, s3client_config=s3client_config, reader_constructor=reader_constructor)  # type: ignore
         self.path = self.fs.init_path(path)
         self.sync_files = False
-        self.GAP_THRESHOLD = 1024
+        self.GAP_THRESHOLD = 1024*1024
         self.use_custom_load = use_custom_load
 
     @classmethod
@@ -508,7 +522,8 @@ class S3StorageReader(FileSystemReader):
             return super().read_data(plan, planner)
 
         print("Using CUSTOM load strategy.-----------------------------------")
-        NUM_PARALLEL_STREAMS = 1
+        print(self.transforms)
+        NUM_PARALLEL_STREAMS = 10
 
         per_file: Dict[str, List[ReadItem]] = dict()
         for read_item in plan.items:
@@ -529,7 +544,7 @@ class S3StorageReader(FileSystemReader):
                 bucket_queue.put(bucket)
 
             # Keep track of active futures
-            active_futures: Dict[Future, None] = {}
+            active_futures: Set[Future] = set()
             futures_lock = Lock()
             all_done = False
 
@@ -537,31 +552,66 @@ class S3StorageReader(FileSystemReader):
                 with self.fs.create_stream(new_path, "rb") as stream:
                     stream.seek(bucket.start_offset)
                     length = bucket.end_offset - bucket.start_offset
-                    stream.prefetch(length)
+                    try:
+                        stream.prefetch(length)
+                    except Exception as e:
+                        print(f"Exception: {e}")
 
                     pref_offset = bucket.start_offset
-                    for cur_offset, req in bucket.items:
+                    print(f"bucket offset {pref_offset}, bucket length {length}, buckets coutn {len(bucket.items)}")
+                    for req in bucket.items:
                         item_md = self.storage_data[req.storage_index]
-                        assert (cur_offset == item_md.offset), f"expected offset {cur_offset}, but got {item_md.offset}"
-                        assert (cur_offset >= pref_offset), f"offset is not ordered {cur_offset} is before {pref_offset}"
-                        pref_offset = cur_offset
+                        assert (item_md.offset >= pref_offset), f"offset is not ordered {item_md.offset} is before {pref_offset}"
+                        pref_offset = item_md.offset
                         assert (item_md.offset >= bucket.start_offset), f"item {item_md.offset} is before {bucket.start_offset}"
                         assert (item_md.offset + item_md.length <= bucket.end_offset), f"item end {item_md.offset + item_md.length} is after {bucket.end_offset}"
 
                         file_slice = _ReaderView(stream, item_md.offset, item_md.length)
+
+                        transform_from = self.transforms.transform_load_stream(
+                            req,
+                            # This field wasn't present in older
+                            # implementations so provide a fallback.
+                            item_md.transform_descriptors or (),
+                            file_slice,
+                        )
                         if req.type == LoadItemType.BYTE_IO:
-                            read_bytes = file_slice.read1(item_md.length)
+                            # read_bytes = file_slice.read1(item_md.length)
+                            read_bytes = io.BytesIO(transform_from.read(-1))
                             read_bytes.seek(0)
                             planner.load_bytes(req, read_bytes)
                         else:
-                            tensor = cast(
-                                Tensor,
-                                torch.load(
-                                    cast(IO[bytes], file_slice.read1(item_md.length)),
-                                    map_location="cpu",
-                                    weights_only=True,
-                                ),
-                            )
+                            # tensor = cast(
+                            #     Tensor,
+                            #     torch.load(
+                            #         cast(IO[bytes], file_slice.read1(item_md.length)),
+                            #         map_location="cpu",
+                            #         weights_only=True,
+                            #     ),
+                            # )
+
+                            if transform_from.seekable():
+                                seekable = transform_from
+                            else:
+                                # torch.load requires a seekable input, so read the transform
+                                # stream now and store the output if needed
+                                seekable = io.BytesIO(transform_from.read(-1))
+                                seekable.seek(0)
+
+                            try:
+                                tensor = cast(
+                                    Tensor,
+                                    torch.load(
+                                        seekable,
+                                        map_location="cpu",
+                                        weights_only=True,
+                                    ),
+                                )
+                            except Exception as e:
+                                print(f"Exception: {e}")
+                                return
+
+
                             tensor = narrow_tensor_by_index(
                                 tensor, req.storage_offsets, req.lengths
                             )
@@ -575,27 +625,28 @@ class S3StorageReader(FileSystemReader):
 
             def future_done_callback(future: Future):
                 with futures_lock:
-                    # Remove the completed future
-                    active_futures.pop(future)
-
                     if not all_done:
                         try:
                             # Get next bucket if available
                             next_bucket = bucket_queue.get_nowait()
                             # Submit new task
                             new_future = executor.submit(process_bucket, next_bucket)
-                            active_futures[new_future] = None
+                            active_futures.add(new_future)
                             new_future.add_done_callback(future_done_callback)
                         except Exception:
-                            # No more buckets to process
+                            # No more buckets to
                             pass
+
+                    # Remove the completed future
+                    active_futures.remove(future)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PARALLEL_STREAMS) as executor:
                 # Initial submission of tasks up to NUM_PARALLEL_STREAMS
                 for _ in range(min(NUM_PARALLEL_STREAMS, len(buckets))):
                     bucket = bucket_queue.get()
                     future = executor.submit(process_bucket, bucket)
-                    active_futures[future] = None
+                    with futures_lock:
+                        active_futures.add(future)
                     future.add_done_callback(future_done_callback)
 
                 # Wait for all tasks to complete

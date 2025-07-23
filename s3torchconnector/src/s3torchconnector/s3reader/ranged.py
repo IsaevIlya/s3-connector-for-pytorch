@@ -93,6 +93,19 @@ class RangedS3Reader(S3Reader):
     def key(self) -> str:
         return self._key
 
+    def prefetch(self, size: int):
+        print(f"Prefetching {self._position} - {self._position + size} ============================")
+        buf_size = max(self._buffer_size, size)
+        self._buffer_size = buf_size
+        self._enable_buffering = buf_size > 0
+        self._buffer: Optional[bytearray] = (
+            bytearray(self._buffer_size) if self._enable_buffering else None
+        )
+        self._buffer_view: Optional[memoryview] = (
+            memoryview(self._buffer) if self._buffer else None
+        )
+        self._load_buffer(buf_size)
+
     @cached_property
     def _object_info(self):
         return self._get_object_info()

@@ -34,6 +34,10 @@ class S3Reader(ABC, io.BufferedIOBase):
         pass
 
     @abstractmethod
+    def prefetch(self, size: int):
+        pass
+
+    @abstractmethod
     def seek(self, offset: int, whence: int = SEEK_SET, /) -> int:
         pass
 

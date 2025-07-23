@@ -82,8 +82,8 @@ class VirtualRegexContainer:
     def __contains__(self, item: str) -> bool:
         # print(f"Item name: {item}")
         verdict = self.regex.search(item) is not None
-        if not verdict:
-            print(f"Skipping {item}")
+        # if not verdict:
+        #     print(f"Skipping {item}")
         return verdict
 
 
@@ -166,9 +166,7 @@ def _compare_models(model1, st_dict2, keys_regex, rtol=1e-5, atol=1e-8):
         item_2 = st_dict2[key_1]
         if not torch.allclose(item_1, item_2, rtol=rtol, atol=atol):
             print(f"Key {key_1} is not equal")
-            print(item_1)
-            print(item_2)
-            # return False
+            return False
         else:
             print(f"Key {key_1} is equal")
     print("No difference")
@@ -282,7 +280,7 @@ def run_fsdp(
     # dcp.load(sd_out, storage_reader=storage_reader)
 
     def load_model(model_only: bool, seq: bool, use_custom_load: bool):
-        storage_reader = get_reader(region, uri, suffix, True, use_custom_load)
+        storage_reader = get_reader(region, uri, suffix, seq, use_custom_load)
 
         start_load = perf_counter()
         sd_out: STATE_DICT_TYPE = {}
@@ -332,7 +330,6 @@ if __name__ == "__main__":
 
     region = args.region
     uri = args.uri
-    suffix = "experiment_ordered"
-    suffix = "experiment_27"
+    suffix = "experiment"
     checkpoint_sharding_strategy = "hybrid"
     run_fsdp(rank, world_size, thread_count, backend, region, uri, suffix, checkpoint_sharding_strategy=checkpoint_sharding_strategy)
