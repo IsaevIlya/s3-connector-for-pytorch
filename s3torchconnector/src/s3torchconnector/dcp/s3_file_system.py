@@ -8,7 +8,7 @@ import time
 import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Generator, Union, Optional, Tuple, Set
+from typing import Generator, Union, Optional, Tuple, Set, Callable
 from typing import List
 
 from s3torchconnectorclient._mountpoint_s3_client import S3Exception
@@ -265,23 +265,17 @@ class StorageMetadata:
     prefix: str
 
 
-
-
-# from torch.distributed.checkpoint.filesystem import _split_by_size_and_type as original_split
-#
-# def _ordered_split_by_size_and_type(bins: int, items: List[WriteItem]) -> List[List[WriteItem]]:
-#     buckets = original_split(bins, items)
-#     for bucket in buckets:
-#         bucket.sort(key=lambda item: item.index.fqn)
-#     print("****************REORDER TENSORS**************************")
-#     return buckets
-#
-# # Replace the original function
-# # Import the module where the function is used
-# import torch.distributed.checkpoint.filesystem as fs_module
-#
-# # Replace the original function with our new one
-# fs_module._split_by_size_and_type = _ordered_split_by_size_and_type
+from typing import Callable
+from torch.distributed.checkpoint.filesystem import _split_by_size_and_type as original_split
+def _ordered_split_by_size_and_type(bins: int, items: List[WriteItem], sort_key: Optional[Callable] = None) -> List[List[WriteItem]]:
+    buckets = original_split(bins, items)
+    for bucket in buckets:
+        if sort_key:
+            bucket.sort(key=sort_key)
+        else:
+            bucket.sort(key=lambda item: item.index.fqn)
+    print("****************REORDER TENSORS**************************")
+    return buckets
 
 class S3StorageWriter(FileSystemWriter):
     def __init__(
@@ -290,6 +284,7 @@ class S3StorageWriter(FileSystemWriter):
         path: str,
         s3client_config: Optional[S3ClientConfig] = None,
         prefix_strategy: Optional[S3PrefixStrategyBase] = None,
+        sort_key: Optional[Callable] = None,
         **kwargs,
     ) -> None:
         """
@@ -311,6 +306,13 @@ class S3StorageWriter(FileSystemWriter):
         self.fs = S3FileSystem(region, s3client_config=s3client_config)  # type: ignore
         self.path = self.fs.init_path(path)
         self.prefix_strategy = prefix_strategy or DefaultPrefixStrategy()
+        self.sort_key = sort_key
+
+        # Replace the original split function with our custom one
+        import torch.distributed.checkpoint.filesystem as fs_module
+        # Use functools.partial to bind the sort_key parameter
+        from functools import partial
+        fs_module._split_by_size_and_type = partial(_ordered_split_by_size_and_type, sort_key=sort_key)
 
     def prepare_global_plan(self, plans: List[SavePlan]) -> List[SavePlan]:
         """
@@ -523,7 +525,7 @@ class S3StorageReader(FileSystemReader):
 
         print("Using CUSTOM load strategy.-----------------------------------")
         print(self.transforms)
-        NUM_PARALLEL_STREAMS = 10
+        NUM_PARALLEL_STREAMS = 1
 
         per_file: Dict[str, List[ReadItem]] = dict()
         for read_item in plan.items:
